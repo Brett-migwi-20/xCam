@@ -49,6 +49,7 @@ import com.hazbu.xcam.data.Constants.ACTION_PLAYBACK_PREVIOUS
 import com.hazbu.xcam.data.Constants.ACTION_PLAYBACK_TOGGLE
 import com.hazbu.xcam.data.PlaybackGateway
 import com.hazbu.xcam.utils.Logger
+import com.hazbu.xcam.utils.MediaConverter
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -319,57 +320,71 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
     }
 
     private fun copyMediaToInternal(uri: Uri) {
+        // File copying runs on the background executor. The Transformer itself is
+        // started on the main thread inside MediaConverter, and its callbacks
+        // (onSuccess / onError) are delivered on the main thread.
         mediaImportExecutor.execute {
             try {
-            val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-            val isImage = mimeType.startsWith("image/")
-            val isVideo = mimeType.startsWith("video/")
+                val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+                val isImage = mimeType.startsWith("image/")
+                val isVideo = mimeType.startsWith("video/")
 
-            if (!isImage && !isVideo) {
-                runOnUiThread { Toast.makeText(this, "Invalid file type. Only images and videos are supported.", Toast.LENGTH_LONG).show() }
-                return@execute
-            }
-
-            val extension = android.webkit.MimeTypeMap.getSingleton()
-                .getExtensionFromMimeType(mimeType) ?: "bin"
-            val importId = System.currentTimeMillis()
-
-            if (isImage) {
-                val internalImage = File(filesDir, "$VIRTUAL_PREFIX$importId.$extension")
-                contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(internalImage).use { output -> input.copyTo(output) }
-                }
-                
-                val outputVideo = File(filesDir, "$VIRTUAL_PREFIX$importId.mp4")
-                runOnUiThread { Toast.makeText(this, "Converting image to video...", Toast.LENGTH_SHORT).show() }
-                
-                com.hazbu.xcam.utils.MediaConverter.convertImageToMp4(
-                    this, Uri.fromFile(internalImage), outputVideo
-                ) { success ->
+                if (!isImage && !isVideo) {
                     runOnUiThread {
-                        internalImage.delete()
-                        if (success) {
-                            saveMediaPath(outputVideo.absolutePath)
+                        Toast.makeText(this, "Invalid file type. Only images and videos are supported.", Toast.LENGTH_LONG).show()
+                    }
+                    return@execute
+                }
+
+                val extension = android.webkit.MimeTypeMap.getSingleton()
+                    .getExtensionFromMimeType(mimeType) ?: "bin"
+                val importId = System.currentTimeMillis()
+
+                if (isImage) {
+                    val internalImage = File(filesDir, "$VIRTUAL_PREFIX$importId.$extension")
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(internalImage).use { output -> input.copyTo(output) }
+                    }
+
+                    val outputVideo = File(filesDir, "$VIRTUAL_PREFIX$importId.mp4")
+                    if (outputVideo.exists()) outputVideo.delete() // Transformer won't overwrite
+
+                    runOnUiThread {
+                        Toast.makeText(this, "Converting image to video...", Toast.LENGTH_SHORT).show()
+                    }
+
+                    MediaConverter.convertImageToMp4(
+                        context = this,
+                        imageUri = Uri.fromFile(internalImage),
+                        outputPath = outputVideo.absolutePath,
+                        onSuccess = { path ->
+                            // Main thread
+                            internalImage.delete()
+                            saveMediaPath(path)
                             Logger.event(this, Logger.Category.MEDIA, Logger.Level.INFO, "media_imported", outputVideo.name)
                             Toast.makeText(this, R.string.toast_media_imported, Toast.LENGTH_SHORT).show()
-                        } else {
-                            Toast.makeText(this, "Conversion failed", Toast.LENGTH_SHORT).show()
+                        },
+                        onError = { e ->
+                            // Main thread
+                            internalImage.delete()
+                            outputVideo.delete()
+                            Logger.event(this, Logger.Category.ERROR, Logger.Level.ERROR, "media_import_failed", e.message.orEmpty(), e)
+                            Toast.makeText(this, getString(R.string.toast_media_import_failed, e.message), Toast.LENGTH_LONG).show()
+                        }
+                    )
+                } else {
+                    val internalFile = File(filesDir, "$VIRTUAL_PREFIX$importId.$extension")
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(internalFile).use { output ->
+                            input.copyTo(output)
                         }
                     }
-                }
-            } else {
-                val internalFile = File(filesDir, "$VIRTUAL_PREFIX$importId.$extension")
-                contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(internalFile).use { output ->
-                        input.copyTo(output)
+                    runOnUiThread {
+                        saveMediaPath(internalFile.absolutePath)
+                        Logger.event(this, Logger.Category.MEDIA, Logger.Level.INFO, "media_imported", internalFile.name)
+                        Toast.makeText(this, R.string.toast_media_imported, Toast.LENGTH_SHORT).show()
                     }
                 }
-                runOnUiThread {
-                    saveMediaPath(internalFile.absolutePath)
-                    Logger.event(this, Logger.Category.MEDIA, Logger.Level.INFO, "media_imported", internalFile.name)
-                    Toast.makeText(this, R.string.toast_media_imported, Toast.LENGTH_SHORT).show()
-                }
-            }
             } catch (e: Exception) {
                 Logger.event(this, Logger.Category.ERROR, Logger.Level.ERROR, "media_import_failed", e.message.orEmpty(), e)
                 runOnUiThread {
@@ -529,7 +544,7 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         displayedLogs = logs.asReversed().filter { entry ->
             val fields = entry.split('|', limit = 5)
             (category == "All" || fields.getOrNull(2) == category) &&
-                (level == "All" || fields.getOrNull(1) == level)
+                    (level == "All" || fields.getOrNull(1) == level)
         }.joinToString("\n") { it.replace('|', ' ') }
         tvLogs.text = displayedLogs.ifBlank { getString(R.string.label_no_logs) }
     }
