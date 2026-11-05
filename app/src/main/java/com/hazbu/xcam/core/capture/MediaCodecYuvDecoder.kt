@@ -6,48 +6,85 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.os.SystemClock
 import androidx.core.net.toUri
-import java.nio.ByteBuffer
+import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.LockSupport
 
 /**
- * Lightweight hardware MediaCodec-based video decoder that outputs raw YUV_420_888 frames
- * directly, avoiding CPU-heavy Bitmap and JPEG conversion loops.
- * Aligned with CamSwap's high-speed YUV pump architecture.
+ * Hardware decoder for ImageReader injection. It maintains a bounded, reference-counted
+ * latest-frame pool: consumers get the newest complete frame or no frame, never a backlog.
  */
 class MediaCodecYuvDecoder(
     private val context: Context,
     private val mediaPath: String,
-    private val logAction: (String) -> Unit
+    private val logAction: (String) -> Unit,
 ) {
-    class YuvFrame(
+    class YuvFrame internal constructor(
         val width: Int,
         val height: Int,
         val yPlane: ByteArray,
         val uPlane: ByteArray,
         val vPlane: ByteArray,
-        val timestampNs: Long
+        val timestampNs: Long,
+        private val releaseAction: () -> Unit,
+    ) : AutoCloseable {
+        private var references = 1
+        private var released = false
+
+        internal fun retain(): Boolean = synchronized(this) {
+            if (released) false else {
+                references++
+                true
+            }
+        }
+
+        fun release() = close()
+
+        override fun close() {
+            val releaseStorage = synchronized(this) {
+                if (released) return
+                references--
+                if (references == 0) {
+                    released = true
+                    true
+                } else false
+            }
+            if (releaseStorage) releaseAction()
+        }
+    }
+
+    data class Metrics(
+        val deliveredFrames: Long,
+        val droppedFrames: Long,
+        val averageCopyMs: Double,
+        val outputFps: Double,
+        val initializationMs: Long,
     )
 
-    @Volatile
-    private var isRunning = false
-    private var decodeThread: Thread? = null
+    private class FrameStorage(val width: Int, val height: Int) {
+        val y = ByteArray(width * height)
+        val u = ByteArray(((width + 1) / 2) * ((height + 1) / 2))
+        val v = ByteArray(((width + 1) / 2) * ((height + 1) / 2))
+    }
 
-    @Volatile
-    var latestFrame: YuvFrame? = null
-        private set
+    private val frameLock = Any()
+    private val poolLock = Any()
+    private val available = ArrayDeque<FrameStorage>()
+    private var allocatedStorage = 0
+    private var latestFrame: YuvFrame? = null
 
-    @Volatile
-    var videoWidth = 0
-        private set
-
-    @Volatile
-    var videoHeight = 0
-        private set
+    @Volatile private var isRunning = false
+    @Volatile private var decodeThread: Thread? = null
+    @Volatile var videoWidth = 0; private set
+    @Volatile var videoHeight = 0; private set
+    @Volatile var metrics = Metrics(0, 0, 0.0, 0.0, 0); private set
 
     fun start() {
         if (isRunning) return
         isRunning = true
-        decodeThread = Thread({ decodeLoop() }, "xCam-YuvDecoder").apply {
+        decodeThread = Thread(::decodeLoop, "xCam-YuvDecoder").apply {
             isDaemon = true
             start()
         }
@@ -56,178 +93,185 @@ class MediaCodecYuvDecoder(
     fun stop() {
         isRunning = false
         decodeThread?.interrupt()
-        try {
-            decodeThread?.join(500)
-        } catch (_: InterruptedException) {}
+        runCatching { decodeThread?.join(1_000) }
         decodeThread = null
-        latestFrame = null
+        synchronized(frameLock) {
+            latestFrame?.release()
+            latestFrame = null
+        }
+        synchronized(poolLock) {
+            available.clear()
+            allocatedStorage = 0
+        }
+    }
+
+    /** Acquire a stable reference; callers must release it in a finally block. */
+    fun acquireLatestFrame(): YuvFrame? = synchronized(frameLock) {
+        latestFrame?.takeIf { it.retain() }
     }
 
     private fun decodeLoop() {
         var extractor: MediaExtractor? = null
         var codec: MediaCodec? = null
+        val initStartedMs = SystemClock.elapsedRealtime()
+        var delivered = 0L
+        var dropped = 0L
+        var totalCopyNs = 0L
+        var statsStartedMs = initStartedMs
+        var statsDelivered = 0L
+        var firstPtsUs = Long.MIN_VALUE
+        var presentationBaseNs = 0L
+        var lastPtsUs = Long.MIN_VALUE
 
         try {
-            extractor = MediaExtractor().apply {
-                setDataSource(context, mediaPath.toUri(), null)
-            }
-
-            var videoTrackIndex = -1
-            var videoFormat: MediaFormat? = null
-
-            for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("video/")) {
-                    videoTrackIndex = i
-                    videoFormat = format
-                    break
-                }
-            }
-
-            if (videoTrackIndex == -1 || videoFormat == null) {
-                logAction("[YUV-DECODER] No video track found in $mediaPath")
+            extractor = MediaExtractor().apply { setDataSource(context, mediaPath.toUri(), null) }
+            val trackIndex = (0 until extractor.trackCount).firstOrNull { index ->
+                extractor.getTrackFormat(index).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
+            } ?: run {
+                logAction("[DECODER] No video track in ${mediaPath.substringAfterLast('/')}")
                 return
             }
-
-            extractor.selectTrack(videoTrackIndex)
-            videoWidth = videoFormat.getInteger(MediaFormat.KEY_WIDTH)
-            videoHeight = videoFormat.getInteger(MediaFormat.KEY_HEIGHT)
-
-            val mime = videoFormat.getString(MediaFormat.KEY_MIME) ?: "video/avc"
-            videoFormat.setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
-            )
-
+            val format = extractor.getTrackFormat(trackIndex)
+            extractor.selectTrack(trackIndex)
+            videoWidth = format.getInteger(MediaFormat.KEY_WIDTH)
+            videoHeight = format.getInteger(MediaFormat.KEY_HEIGHT)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: "video/avc"
+            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
             codec = MediaCodec.createDecoderByType(mime).apply {
-                configure(videoFormat, null, null, 0)
+                configure(format, null, null, 0)
                 start()
             }
+            val initializationMs = SystemClock.elapsedRealtime() - initStartedMs
+            metrics = metrics.copy(initializationMs = initializationMs)
+            logAction("[DECODER] Hardware decoder ready ${videoWidth}x${videoHeight} in ${initializationMs}ms")
 
-            val bufferInfo = MediaCodec.BufferInfo()
-            val timeoutUs = 10_000L
-            var isInputEos = false
-
-            val frameDurationMs = 1000L / (videoFormat.runCatching { getInteger(MediaFormat.KEY_FRAME_RATE) }.getOrNull() ?: 30).coerceAtLeast(15)
-
+            val info = MediaCodec.BufferInfo()
             while (isRunning) {
-                val loopStartMs = System.currentTimeMillis()
-
-                if (!isInputEos) {
-                    val inIndex = codec.dequeueInputBuffer(timeoutUs)
-                    if (inIndex >= 0) {
-                        val inputBuffer = codec.getInputBuffer(inIndex)
-                        if (inputBuffer != null) {
-                            var sampleSize = extractor.readSampleData(inputBuffer, 0)
-                            if (sampleSize < 0) {
-                                extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-                                sampleSize = extractor.readSampleData(inputBuffer, 0)
-                            }
-
-                            if (sampleSize > 0) {
-                                codec.queueInputBuffer(
-                                    inIndex,
-                                    0,
-                                    sampleSize,
-                                    extractor.sampleTime,
-                                    0
-                                )
-                                extractor.advance()
-                            } else {
-                                codec.queueInputBuffer(inIndex, 0, 0, 0, 0)
-                            }
+                val inputIndex = codec.dequeueInputBuffer(10_000)
+                if (inputIndex >= 0) {
+                    val input = codec.getInputBuffer(inputIndex)
+                    if (input != null) {
+                        var sampleSize = extractor.readSampleData(input, 0)
+                        if (sampleSize < 0) {
+                            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                            sampleSize = extractor.readSampleData(input, 0)
+                        }
+                        if (sampleSize > 0) {
+                            codec.queueInputBuffer(inputIndex, 0, sampleSize, extractor.sampleTime, extractor.sampleFlags)
+                            extractor.advance()
                         }
                     }
                 }
 
-                val outIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)
-                if (outIndex >= 0) {
-                    val image: Image? = codec.getOutputImage(outIndex)
-                    if (image != null) {
-                        val frame = extractYuvFrame(image)
-                        latestFrame = frame
-                        image.close()
+                val outputIndex = codec.dequeueOutputBuffer(info, 10_000)
+                when {
+                    outputIndex >= 0 -> {
+                        val ptsUs = info.presentationTimeUs
+                        if (firstPtsUs == Long.MIN_VALUE || ptsUs < lastPtsUs) {
+                            firstPtsUs = ptsUs
+                            presentationBaseNs = System.nanoTime()
+                        }
+                        lastPtsUs = ptsUs
+                        val desiredNs = presentationBaseNs + (ptsUs - firstPtsUs) * 1_000L
+                        val waitNs = desiredNs - System.nanoTime()
+                        if (waitNs > 0L) LockSupport.parkNanos(waitNs.coerceAtMost(20_000_000L))
+                        val latenessNs = System.nanoTime() - desiredNs
+                        if (latenessNs > MAX_FRAME_LATENESS_NS) {
+                            dropped++
+                        } else {
+                            val image = codec.getOutputImage(outputIndex)
+                            if (image != null) {
+                                val copyStarted = System.nanoTime()
+                                val storage = acquireStorage(image.width, image.height)
+                                if (storage == null) {
+                                    dropped++
+                                } else {
+                                    copyImage(image, storage)
+                                    publish(storage, ptsUs * 1_000L)
+                                    delivered++
+                                    statsDelivered++
+                                    totalCopyNs += System.nanoTime() - copyStarted
+                                }
+                                image.close()
+                            }
+                        }
+                        codec.releaseOutputBuffer(outputIndex, false)
                     }
-                    codec.releaseOutputBuffer(outIndex, false)
+                    outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        val outputFormat = codec.outputFormat
+                        videoWidth = outputFormat.getInteger(MediaFormat.KEY_WIDTH)
+                        videoHeight = outputFormat.getInteger(MediaFormat.KEY_HEIGHT)
+                        logAction("[DECODER] Output format ${videoWidth}x${videoHeight}")
+                    }
                 }
 
-                val elapsedMs = System.currentTimeMillis() - loopStartMs
-                val sleepMs = frameDurationMs - elapsedMs
-                if (sleepMs > 0) {
-                    Thread.sleep(sleepMs)
+                val now = SystemClock.elapsedRealtime()
+                if (now - statsStartedMs >= 5_000L) {
+                    val intervalMs = (now - statsStartedMs).coerceAtLeast(1)
+                    val fps = statsDelivered * 1_000.0 / intervalMs
+                    val averageCopyMs = if (delivered == 0L) 0.0 else totalCopyNs / 1_000_000.0 / delivered
+                    metrics = Metrics(delivered, dropped, averageCopyMs, fps, metrics.initializationMs)
+                    logAction("[PERFORMANCE] decoder fps=${"%.1f".format(fps)} copy=${"%.2f".format(averageCopyMs)}ms delivered=$delivered dropped=$dropped")
+                    statsStartedMs = now
+                    statsDelivered = 0
                 }
             }
         } catch (_: InterruptedException) {
-        } catch (e: Throwable) {
-            logAction("[YUV-DECODER] Decoder error: ${e.message}")
+            // stop() uses interruption to unblock MediaCodec waits.
+        } catch (error: Throwable) {
+            logAction("[DECODER] Failure: ${error.message}")
         } finally {
-            try { codec?.stop() } catch (_: Throwable) {}
-            try { codec?.release() } catch (_: Throwable) {}
-            try { extractor?.release() } catch (_: Throwable) {}
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            runCatching { extractor?.release() }
         }
     }
 
-    private fun extractYuvFrame(image: Image): YuvFrame {
-        val width = image.width
-        val height = image.height
-        val planes = image.planes
+    private fun acquireStorage(width: Int, height: Int): FrameStorage? = synchronized(poolLock) {
+        val existing = available.firstOrNull { it.width == width && it.height == height }
+        if (existing != null) {
+            available.remove(existing)
+            return@synchronized existing
+        }
+        if (allocatedStorage >= MAX_BUFFERED_FRAMES) return@synchronized null
+        allocatedStorage++
+        FrameStorage(width, height)
+    }
 
-        val ySize = width * height
-        val cw = (width + 1) / 2
-        val ch = (height + 1) / 2
-        val uvSize = cw * ch
+    private fun publish(storage: FrameStorage, timestampNs: Long) {
+        val frame = YuvFrame(storage.width, storage.height, storage.y, storage.u, storage.v, timestampNs) {
+            synchronized(poolLock) { available.addLast(storage) }
+        }
+        synchronized(frameLock) {
+            val previous = latestFrame
+            latestFrame = frame
+            previous?.release()
+        }
+    }
 
-        val yBytes = ByteArray(ySize)
-        val uBytes = ByteArray(uvSize)
-        val vBytes = ByteArray(uvSize)
+    private fun copyImage(image: Image, storage: FrameStorage) {
+        copyPlane(image.planes[0], storage.y, image.width, image.height)
+        val chromaWidth = (image.width + 1) / 2
+        val chromaHeight = (image.height + 1) / 2
+        copyPlane(image.planes[1], storage.u, chromaWidth, chromaHeight)
+        copyPlane(image.planes[2], storage.v, chromaWidth, chromaHeight)
+    }
 
-        // Y plane
-        val yPlane = planes[0]
-        val yBuf = yPlane.buffer.duplicate()
-        val yRowStride = yPlane.rowStride
-        val yPixelStride = yPlane.pixelStride
-        val yPos = yBuf.position()
-
-        if (yPixelStride == 1 && yRowStride == width) {
-            yBuf.get(yBytes, 0, minOf(yBytes.size, yBuf.remaining()))
-        } else {
-            for (row in 0 until height) {
-                val rowStart = yPos + row * yRowStride
-                val dstBase = row * width
-                for (col in 0 until width) {
-                    yBytes[dstBase + col] = yBuf.get(rowStart + col * yPixelStride)
-                }
+    private fun copyPlane(plane: Image.Plane, target: ByteArray, width: Int, height: Int) {
+        val buffer = plane.buffer.duplicate()
+        val start = buffer.position()
+        for (row in 0 until height) {
+            val rowStart = start + row * plane.rowStride
+            val destination = row * width
+            for (column in 0 until width) {
+                val source = rowStart + column * plane.pixelStride
+                if (source < buffer.limit()) target[destination + column] = buffer.get(source)
             }
         }
+    }
 
-        // U and V planes
-        val uPlane = planes[1]
-        val vPlane = planes[2]
-        val uBuf = uPlane.buffer.duplicate()
-        val vBuf = vPlane.buffer.duplicate()
-        val uRowStride = uPlane.rowStride
-        val uPixelStride = uPlane.pixelStride
-        val vRowStride = vPlane.rowStride
-        val vPixelStride = vPlane.pixelStride
-        val uPos = uBuf.position()
-        val vPos = vBuf.position()
-
-        if (uPixelStride == 1 && vPixelStride == 1 && uRowStride == cw && vRowStride == cw) {
-            uBuf.get(uBytes, 0, minOf(uBytes.size, uBuf.remaining()))
-            vBuf.get(vBytes, 0, minOf(vBytes.size, vBuf.remaining()))
-        } else {
-            for (row in 0 until ch) {
-                val uRowStart = uPos + row * uRowStride
-                val vRowStart = vPos + row * vRowStride
-                val dstBase = row * cw
-                for (col in 0 until cw) {
-                    uBytes[dstBase + col] = uBuf.get(uRowStart + col * uPixelStride)
-                    vBytes[dstBase + col] = vBuf.get(vRowStart + col * vPixelStride)
-                }
-            }
-        }
-
-        return YuvFrame(width, height, yBytes, uBytes, vBytes, System.nanoTime())
+    companion object {
+        private const val MAX_BUFFERED_FRAMES = 4
+        private const val MAX_FRAME_LATENESS_NS = 100_000_000L
     }
 }

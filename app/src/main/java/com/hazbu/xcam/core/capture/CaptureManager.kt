@@ -3,11 +3,8 @@ package com.hazbu.xcam.core.capture
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import com.hazbu.xcam.data.Constants.DEFAULT_CAPTURE_HEIGHT
 import com.hazbu.xcam.data.Constants.DEFAULT_CAPTURE_WIDTH
-import com.hazbu.xcam.data.Constants.STREAM_FRAME_INTERVAL_MS
-import java.util.concurrent.Executors
 
 /**
  * Manages frame extraction for still captures and video streaming.
@@ -18,22 +15,15 @@ class CaptureManager(
     private val logAction: (String) -> Unit,
 ) {
     private val uiHandler = Handler(Looper.getMainLooper())
-    private val streamExecutor = Executors.newSingleThreadExecutor()
-    private val streamFrameIntervalMs = STREAM_FRAME_INTERVAL_MS
 
     @Volatile var isCapturing = false
         private set
 
     @Volatile private var cachedCaptureFrame: ByteArray? = null
-    @Volatile private var cachedStreamFrame: ByteArray? = null
     
     private var lastCapturePulseTime = 0L
     private var captureTimeMs = 0
     
-    private var streamKey: String? = null
-    private var streamStartedAtMs = 0L
-    private var lastStreamRequestAtMs = 0L
-    @Volatile private var streamExtractionRunning = false
 
     private fun log(msg: String) = logAction("[CAPTURE] $msg")
 
@@ -41,9 +31,6 @@ class CaptureManager(
         uiHandler.removeCallbacksAndMessages(null)
         isCapturing = false
         cachedCaptureFrame = null
-        cachedStreamFrame = null
-        streamKey = null
-        streamExtractionRunning = false
         log("[*] Manager state RESET")
     }
 
@@ -136,38 +123,14 @@ class CaptureManager(
         isIgnoringHooks: () -> Boolean,
         setIgnoringHooks: (Boolean) -> Unit
     ): ByteArray? {
-        val context = contextProvider() ?: return null
         val actualPath = path ?: return null
         
         if (!actualPath.lowercase().endsWith(".mp4")) {
             return handleCapture(path, width, height, rotationAngle, isMirrored, Int.MAX_VALUE, isIgnoringHooks, setIgnoringHooks)
         }
 
-        val now = SystemClock.elapsedRealtime()
-        val key = "$actualPath|$width|$height|$rotationAngle|$isMirrored"
-        
-        synchronized(this) {
-            if (streamKey != key) {
-                streamKey = key
-                cachedStreamFrame = null
-                streamStartedAtMs = now
-                lastStreamRequestAtMs = 0L
-                streamExtractionRunning = false
-            }
-
-            if (!streamExtractionRunning && now - lastStreamRequestAtMs >= streamFrameIntervalMs) {
-                streamExtractionRunning = true
-                lastStreamRequestAtMs = now
-                val frameTimeMs = (now - streamStartedAtMs).toInt().coerceAtLeast(0)
-                
-                streamExecutor.execute {
-                    performExtraction(context, actualPath, width, height, rotationAngle, isMirrored, frameTimeMs, Int.MAX_VALUE, setIgnoringHooks)?.let {
-                        cachedStreamFrame = it
-                    }
-                    synchronized(this) { streamExtractionRunning = false }
-                }
-            }
-        }
-        return cachedStreamFrame
+        // Video frames are supplied by MediaCodecYuvDecoder in XCamModule. Do not use
+        // MediaMetadataRetriever as a 30fps fallback: it independently decodes every request.
+        return null
     }
 }

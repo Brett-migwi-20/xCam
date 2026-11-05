@@ -1,8 +1,11 @@
 package com.hazbu.xcam.xposed
 
 import android.content.Context
+import android.database.ContentObserver
 import android.graphics.SurfaceTexture
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.view.Surface
 import androidx.media3.common.util.UnstableApi
 import com.hazbu.xcam.core.audio.MediaCodecAudioDecoder
@@ -19,6 +22,7 @@ import com.hazbu.xcam.utils.Logger
 import com.hazbu.xcam.utils.SystemUtils
 import com.hazbu.xcam.utils.UIUtils
 import com.hazbu.xcam.data.Constants
+import com.hazbu.xcam.data.PlaybackGateway
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface
 
@@ -37,7 +41,19 @@ class XCamModule : XposedModule() {
     private val settings = SettingsManager()
     private val surfaceManager = SurfaceManager { printLog(it) }
     private val surfaceProvider = SurfaceProvider { printLog(it) }
-    private val mediaEngine = MediaEngine { printLog(it) }
+    private val mediaEngine = MediaEngine({ printLog(it) }) { event ->
+        val action = when (event) {
+            MediaEngine.PlaybackEvent.STARTED -> Constants.ACTION_PLAYBACK_STARTED
+            MediaEngine.PlaybackEvent.PAUSED -> Constants.ACTION_PLAYBACK_PAUSED
+            MediaEngine.PlaybackEvent.COMPLETED -> Constants.ACTION_PLAYBACK_COMPLETED
+            MediaEngine.PlaybackEvent.ERROR -> null
+        }
+        val context = mContext
+        if (action != null && context != null) {
+            Logger.event(context, Logger.Category.PLAYBACK, Logger.Level.INFO, "engine_${event.name.lowercase()}")
+            PlaybackGateway.action(context, action)
+        }
+    }
     private val yuvProcessor = YuvFrameProcessor()
     
     private val captureManager = CaptureManager(
@@ -53,6 +69,13 @@ class XCamModule : XposedModule() {
         surfaceProvider = surfaceProvider,
     ) { printLog(it) }
 
+    private var observingSettings = false
+    private val settingsObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) {
+            refreshObservedSettings()
+        }
+    }
+
     fun isIgnoringHooks(): Boolean = ignoreHooks.get() ?: false
     fun setIgnoringHooks(ignore: Boolean) { ignoreHooks.set(ignore) }
 
@@ -63,15 +86,20 @@ class XCamModule : XposedModule() {
         set(value) { surfaceManager.previewSwapped = value }
 
     fun printLog(msg: String, tr: Throwable? = null) {
-        if (tr != null || (msg.contains("Error") || msg.contains("failed") || msg.contains("FATAL"))) {
-            Logger.e(this, msg, tr)
-        } else {
-            Logger.i(this, msg)
+        val category = when {
+            msg.contains("YUV-DECODER") || msg.contains("DECODER") -> Logger.Category.DECODER
+            msg.contains("AUDIO") -> Logger.Category.AUDIO
+            msg.contains("SURFACE") -> Logger.Category.INJECTION
+            msg.contains("CAPTURE") -> Logger.Category.FRAME
+            msg.contains("PLAYBACK") || msg.contains("MEDIA-ENGINE") -> Logger.Category.PLAYBACK
+            else -> Logger.Category.CAMERA
         }
+        val level = if (tr != null || msg.contains("error", true) || msg.contains("failed", true) || msg.contains("FATAL")) Logger.Level.ERROR else Logger.Level.INFO
+        Logger.event(mContext, category, level, "module", msg, tr, this)
     }
 
-    fun logInit(msg: String) = Logger.i(this, "[INIT] $msg")
-    fun logHook(msg: String) = Logger.d(this, "[HOOK] $msg")
+    fun logInit(msg: String) = Logger.event(mContext, Logger.Category.CAMERA, Logger.Level.INFO, "init", msg, xi = this)
+    fun logHook(msg: String) = Logger.event(mContext, Logger.Category.CAMERA, Logger.Level.DEBUG, "hook", msg, xi = this)
 
     fun showToast(message: String) = UIUtils.showToast(mContext, message) { printLog(it) }
 
@@ -115,13 +143,20 @@ class XCamModule : XposedModule() {
     fun injectYuvFrame(image: android.media.Image, width: Int, height: Int) {
         val path = settings.mediaPath
         val ctx = mContext
-        if (path != null && ctx != null && path.lowercase().endsWith(".mp4")) {
+        if (path != null && ctx != null && isVideoPath(path)) {
             val decoder = getOrCreateYuvDecoder(ctx, path)
-            val frame = decoder.latestFrame
+            val frame = decoder.acquireLatestFrame()
             if (frame != null) {
-                yuvProcessor.injectYuvFrame(image, frame)
+                try {
+                    yuvProcessor.injectYuvFrame(image, frame, settings.rotationAngle, settings.isMirrored, settings.isMirrorVertical)
+                } finally {
+                    frame.release()
+                }
                 return
             }
+            // The bounded latest-frame strategy intentionally drops early/late frames instead of
+            // falling back to MediaMetadataRetriever and building latency behind real time.
+            return
         }
 
         val jpeg = handleStreamFrame(width, height) ?: return
@@ -132,12 +167,17 @@ class XCamModule : XposedModule() {
         val path = settings.mediaPath ?: return null
         val ctx = mContext ?: return null
 
-        if (path.lowercase().endsWith(".mp4")) {
+        if (isVideoPath(path)) {
             val decoder = getOrCreateYuvDecoder(ctx, path)
-            val frame = decoder.latestFrame
+            val frame = decoder.acquireLatestFrame()
             if (frame != null) {
-                return yuvProcessor.frameToNv21(frame, width, height)
+                return try {
+                    yuvProcessor.frameToNv21(frame, width, height, settings.rotationAngle, settings.isMirrored, settings.isMirrorVertical)
+                } finally {
+                    frame.release()
+                }
             }
+            return null
         }
 
         val jpeg = handleStreamFrame(width, height) ?: return null
@@ -195,12 +235,16 @@ class XCamModule : XposedModule() {
         val irH = injectors.imageReaderHook.activeCaptureHeight
         val targetW = if (w > 0) w else if (irW > 0) irW else Constants.DEFAULT_CAPTURE_WIDTH
         val targetH = if (h > 0) h else if (irH > 0) irH else Constants.DEFAULT_CAPTURE_HEIGHT
-        return captureManager.handleCapture(
-            settings.mediaPath, targetW, targetH, settings.rotationAngle, settings.isMirrored, maxSize,
-            { isIgnoringHooks() },
-            { setIgnoringHooks(it) },
-            yuvDecoder?.latestFrame
-        )
+        val liveFrame = yuvDecoder?.acquireLatestFrame()
+        return try {
+            captureManager.handleCapture(
+                settings.mediaPath, targetW, targetH, settings.rotationAngle, settings.isMirrored, maxSize,
+                { isIgnoringHooks() },
+                { setIgnoringHooks(it) }, liveFrame
+            )
+        } finally {
+            liveFrame?.release()
+        }
     }
 
     fun handleStreamFrame(w: Int, h: Int) = captureManager.handleStreamFrame(
@@ -241,7 +285,7 @@ class XCamModule : XposedModule() {
         if (currentApp != null && !isInitialized) {
             mContext = currentApp
             logInit("Context immediately resolved from ActivityThread: ${mContext?.packageName}")
-            mContext?.let { settings.refreshSettings(it) }
+            mContext?.let { initialiseSettingsObservation(it) }
             isInitialized = true
         }
 
@@ -254,7 +298,7 @@ class XCamModule : XposedModule() {
                 if (!isInitialized) {
                     mContext = chain.thisObject as? Context
                     logInit("Context Initialized: ${mContext?.packageName}")
-                    mContext?.let { settings.refreshSettings(it) }
+                    mContext?.let { initialiseSettingsObservation(it) }
                     isInitialized = true
                 }
                 result
@@ -262,5 +306,41 @@ class XCamModule : XposedModule() {
         } catch (e: Exception) {
             logInit("Context hook failure: ${e.message}")
         }
+    }
+
+    private fun initialiseSettingsObservation(context: Context) {
+        settings.refreshSettings(context)
+        if (!observingSettings) {
+            context.contentResolver.registerContentObserver(
+                android.net.Uri.parse("content://${Constants.AUTHORITY}"), true, settingsObserver
+            )
+            observingSettings = true
+        }
+    }
+
+    private fun refreshObservedSettings() {
+        val context = mContext ?: return
+        val previousPath = settings.mediaPath
+        val previousRevision = settings.revision
+        settings.refreshSettings(context)
+        if (settings.revision == previousRevision) return
+        if (previousPath != settings.mediaPath) {
+            synchronized(yuvLock) {
+                yuvDecoder?.stop()
+                yuvDecoder = null
+            }
+            synchronized(audioLock) {
+                audioDecoder?.stop()
+                audioDecoder = null
+            }
+            captureManager.reset()
+        }
+        Logger.event(context, Logger.Category.PLAYBACK, Logger.Level.INFO, "settings_changed", "revision=${settings.revision}, media=${settings.mediaPath?.substringAfterLast('/')}")
+        engine.onSettingsChanged()
+    }
+
+    private fun isVideoPath(path: String): Boolean {
+        val extension = path.substringBefore('?').substringAfterLast('.', "").lowercase()
+        return extension in setOf("mp4", "m4v", "webm", "mkv", "3gp", "mov", "avi")
     }
 }

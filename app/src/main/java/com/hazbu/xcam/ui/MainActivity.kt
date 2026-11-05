@@ -11,12 +11,16 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.view.View
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
@@ -40,11 +44,17 @@ import com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_TIME
 import com.hazbu.xcam.data.Constants.KEY_ROTATION_ANGLE
 import com.hazbu.xcam.data.Constants.KEY_MEDIA_PATH
 import com.hazbu.xcam.data.Constants.PREFS_NAME
+import com.hazbu.xcam.data.Constants.ACTION_PLAYBACK_NEXT
+import com.hazbu.xcam.data.Constants.ACTION_PLAYBACK_PREVIOUS
+import com.hazbu.xcam.data.Constants.ACTION_PLAYBACK_TOGGLE
+import com.hazbu.xcam.data.PlaybackGateway
+import com.hazbu.xcam.utils.Logger
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 
@@ -52,7 +62,6 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
 
     companion object {
         private const val VIRTUAL_PREFIX = "virtual."
-        private const val DEFAULT_VIDEO_NAME = "virtual.mp4"
     }
 
     private lateinit var ivPreview: ImageView
@@ -62,6 +71,11 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
     private lateinit var btnRotateLeft: MaterialButton
     private lateinit var btnRotateRight: MaterialButton
     private lateinit var btnSelectVideo: MaterialButton
+    private lateinit var tvRotationValue: TextView
+    private lateinit var tvPlaylistState: TextView
+    private lateinit var btnPlaylistPrevious: MaterialButton
+    private lateinit var btnPlayPause: MaterialButton
+    private lateinit var btnPlaylistNext: MaterialButton
     private lateinit var tvModuleStatus: TextView
     private lateinit var cardModuleStatus: com.google.android.material.card.MaterialCardView
     private lateinit var cardScopedApps: com.google.android.material.card.MaterialCardView
@@ -75,10 +89,25 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
     private lateinit var tvPipelineTime: TextView
     private lateinit var btnCopyPipeline: MaterialButton
     private lateinit var btnClearPipeline: MaterialButton
+    private lateinit var spinnerLogCategory: Spinner
+    private lateinit var spinnerLogLevel: Spinner
+    private lateinit var tvLogs: TextView
+    private lateinit var btnCopyLogs: MaterialButton
+    private lateinit var btnExportLogs: MaterialButton
+    private lateinit var btnClearLogs: MaterialButton
 
     private var isMirrored = false
     private var rotationAngle = 0
     private var mXposedService: XposedService? = null
+    private val mediaImportExecutor = Executors.newSingleThreadExecutor()
+    private val logRefreshHandler = Handler(Looper.getMainLooper())
+    private var displayedLogs = ""
+    private val logRefreshTask = object : Runnable {
+        override fun run() {
+            loadLogs()
+            logRefreshHandler.postDelayed(this, 2_000L)
+        }
+    }
 
     private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -109,12 +138,20 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         setupUI()
         loadSettings()
         updateModuleStatusUI()
+        Logger.event(this, Logger.Category.UI, Logger.Level.INFO, "activity_created")
     }
 
     override fun onResume() {
         super.onResume()
         loadSettings()
         updateModuleStatusUI()
+        logRefreshHandler.removeCallbacks(logRefreshTask)
+        logRefreshHandler.post(logRefreshTask)
+    }
+
+    override fun onPause() {
+        logRefreshHandler.removeCallbacks(logRefreshTask)
+        super.onPause()
     }
 
     override fun onServiceBind(service: XposedService) {
@@ -178,6 +215,11 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         btnRotateLeft = findViewById(R.id.btn_rotate_left)
         btnRotateRight = findViewById(R.id.btn_rotate_right)
         btnSelectVideo = findViewById(R.id.btn_select_video)
+        tvRotationValue = findViewById(R.id.tv_rotation_value)
+        tvPlaylistState = findViewById(R.id.tv_playlist_state)
+        btnPlaylistPrevious = findViewById(R.id.btn_playlist_previous)
+        btnPlayPause = findViewById(R.id.btn_play_pause)
+        btnPlaylistNext = findViewById(R.id.btn_playlist_next)
         tvModuleStatus = findViewById(R.id.tv_module_status)
         cardModuleStatus = findViewById(R.id.card_module_status)
         cardScopedApps = findViewById(R.id.card_scoped_apps)
@@ -191,6 +233,13 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         tvPipelineTime = findViewById(R.id.tv_pipeline_time)
         btnCopyPipeline = findViewById(R.id.btn_copy_pipeline)
         btnClearPipeline = findViewById(R.id.btn_clear_pipeline)
+        spinnerLogCategory = findViewById(R.id.spinner_log_category)
+        spinnerLogLevel = findViewById(R.id.spinner_log_level)
+        tvLogs = findViewById(R.id.tv_logs)
+        btnCopyLogs = findViewById(R.id.btn_copy_logs)
+        btnExportLogs = findViewById(R.id.btn_export_logs)
+        btnClearLogs = findViewById(R.id.btn_clear_logs)
+        setupLogsUi()
 
         switchCaptureNotif.setOnCheckedChangeListener { _, isChecked ->
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit {
@@ -255,6 +304,9 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
             saveSettings()
             updatePreviewTransform()
         }
+        btnPlaylistPrevious.setOnClickListener { performPlaybackAction(ACTION_PLAYBACK_PREVIOUS) }
+        btnPlayPause.setOnClickListener { performPlaybackAction(ACTION_PLAYBACK_TOGGLE) }
+        btnPlaylistNext.setOnClickListener { performPlaybackAction(ACTION_PLAYBACK_NEXT) }
         btnDeleteMedia.setOnClickListener { deleteMedia() }
         btnSelectVideo.setOnClickListener {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -267,29 +319,29 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
     }
 
     private fun copyMediaToInternal(uri: Uri) {
-        try {
+        mediaImportExecutor.execute {
+            try {
             val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
             val isImage = mimeType.startsWith("image/")
             val isVideo = mimeType.startsWith("video/")
 
             if (!isImage && !isVideo) {
-                Toast.makeText(this, "Invalid file type. Only images and videos are supported.", Toast.LENGTH_LONG).show()
-                return
+                runOnUiThread { Toast.makeText(this, "Invalid file type. Only images and videos are supported.", Toast.LENGTH_LONG).show() }
+                return@execute
             }
-            
-            filesDir.listFiles { _, name -> name.startsWith(VIRTUAL_PREFIX) }?.forEach { it.delete() }
 
             val extension = android.webkit.MimeTypeMap.getSingleton()
                 .getExtensionFromMimeType(mimeType) ?: "bin"
+            val importId = System.currentTimeMillis()
 
             if (isImage) {
-                val internalImage = File(filesDir, VIRTUAL_PREFIX + extension)
+                val internalImage = File(filesDir, "$VIRTUAL_PREFIX$importId.$extension")
                 contentResolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(internalImage).use { output -> input.copyTo(output) }
                 }
                 
-                val outputVideo = File(filesDir, DEFAULT_VIDEO_NAME)
-                Toast.makeText(this, "Converting image to video...", Toast.LENGTH_SHORT).show()
+                val outputVideo = File(filesDir, "$VIRTUAL_PREFIX$importId.mp4")
+                runOnUiThread { Toast.makeText(this, "Converting image to video...", Toast.LENGTH_SHORT).show() }
                 
                 com.hazbu.xcam.utils.MediaConverter.convertImageToMp4(
                     this, Uri.fromFile(internalImage), outputVideo
@@ -298,6 +350,7 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
                         internalImage.delete()
                         if (success) {
                             saveMediaPath(outputVideo.absolutePath)
+                            Logger.event(this, Logger.Category.MEDIA, Logger.Level.INFO, "media_imported", outputVideo.name)
                             Toast.makeText(this, R.string.toast_media_imported, Toast.LENGTH_SHORT).show()
                         } else {
                             Toast.makeText(this, "Conversion failed", Toast.LENGTH_SHORT).show()
@@ -305,18 +358,25 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
                     }
                 }
             } else {
-                val internalFile = File(filesDir, VIRTUAL_PREFIX + extension)
+                val internalFile = File(filesDir, "$VIRTUAL_PREFIX$importId.$extension")
                 contentResolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(internalFile).use { output ->
                         input.copyTo(output)
                     }
                 }
-                saveMediaPath(internalFile.absolutePath)
-                Toast.makeText(this, R.string.toast_media_imported, Toast.LENGTH_SHORT).show()
+                runOnUiThread {
+                    saveMediaPath(internalFile.absolutePath)
+                    Logger.event(this, Logger.Category.MEDIA, Logger.Level.INFO, "media_imported", internalFile.name)
+                    Toast.makeText(this, R.string.toast_media_imported, Toast.LENGTH_SHORT).show()
+                }
             }
-        } catch (e: Exception) {
-            val errorMsg = getString(R.string.toast_media_import_failed, e.message)
-            Toast.makeText(this, errorMsg, Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Logger.event(this, Logger.Category.ERROR, Logger.Level.ERROR, "media_import_failed", e.message.orEmpty(), e)
+                runOnUiThread {
+                    val errorMsg = getString(R.string.toast_media_import_failed, e.message)
+                    Toast.makeText(this, errorMsg, Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -328,6 +388,7 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         switchCaptureNotif.isChecked = prefs.getBoolean(KEY_ENABLE_CAPTURE_NOTIF, true)
         updatePreview(mediaPath)
         updatePreviewTransform()
+        updatePlaylistControls(prefs)
         loadTelemetryUI()
     }
 
@@ -353,6 +414,7 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
     private fun updatePreviewTransform() {
         ivPreview.scaleX = if (isMirrored) -1f else 1f
         ivPreview.rotation = rotationAngle.toFloat()
+        tvRotationValue.text = getString(R.string.label_rotation_value, rotationAngle)
         val activeColor = MaterialColors.getColor(btnMirror, androidx.appcompat.R.attr.colorPrimary)
         val activeIconColor = MaterialColors.getColor(btnMirror, com.google.android.material.R.attr.colorOnPrimary, android.graphics.Color.WHITE)
         val inactiveColor = MaterialColors.getColor(btnMirror, com.google.android.material.R.attr.colorSecondaryContainer, android.graphics.Color.LTGRAY)
@@ -388,28 +450,102 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
     }
 
     private fun saveSettings() {
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit {
-            putBoolean(KEY_IS_MIRRORED, isMirrored)
-            putInt(KEY_ROTATION_ANGLE, rotationAngle)
-        }
+        PlaybackGateway.setOrientation(this, rotationAngle, isMirrored)
+        Logger.event(this, Logger.Category.ROTATION, Logger.Level.INFO, "orientation_requested", "rotation=$rotationAngle, mirror=$isMirrored")
     }
 
     private fun saveMediaPath(path: String) {
-        isMirrored = false
-        rotationAngle = 0
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit {
-            putString(KEY_MEDIA_PATH, path)
-            putBoolean(KEY_IS_MIRRORED, isMirrored)
-            putInt(KEY_ROTATION_ANGLE, rotationAngle)
-        }
+        PlaybackGateway.setMedia(this, path)
         updatePreview(path)
         updatePreviewTransform()
+        loadSettings()
     }
 
     private fun deleteMedia() {
-        filesDir.listFiles { _, name -> name.startsWith(VIRTUAL_PREFIX) }?.forEach { it.delete() }
-        saveMediaPath("")
+        val path = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(KEY_MEDIA_PATH, null)
+        path?.let { File(it).takeIf(File::exists)?.delete() }
+        PlaybackGateway.setMedia(this, "")
+        loadSettings()
+        Logger.event(this, Logger.Category.MEDIA, Logger.Level.INFO, "media_removed", path?.substringAfterLast('/').orEmpty())
         Toast.makeText(this, R.string.toast_media_removed, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun performPlaybackAction(action: String) {
+        PlaybackGateway.action(this, action)
+        Logger.event(this, Logger.Category.PLAYBACK, Logger.Level.INFO, "ui_action", action.substringAfterLast('.'))
+        loadSettings()
+    }
+
+    private fun updatePlaylistControls(prefs: android.content.SharedPreferences) {
+        val index = prefs.getInt(com.hazbu.xcam.data.Constants.KEY_PLAYLIST_INDEX, -1)
+        val state = prefs.getString(com.hazbu.xcam.data.Constants.KEY_PLAYBACK_STATE, "paused") ?: "paused"
+        val raw = prefs.getString(com.hazbu.xcam.data.Constants.KEY_PLAYLIST, "[]") ?: "[]"
+        val size = runCatching { org.json.JSONArray(raw).length() }.getOrDefault(0)
+        tvPlaylistState.text = if (size == 0) getString(R.string.label_playlist_empty) else getString(R.string.label_playlist_state, index + 1, size, state.replaceFirstChar { it.uppercase() })
+        btnPlayPause.text = if (state == "playing") getString(R.string.btn_pause) else getString(R.string.btn_play)
+        val enabled = size > 0
+        btnPlaylistPrevious.isEnabled = enabled
+        btnPlayPause.isEnabled = enabled
+        btnPlaylistNext.isEnabled = enabled
+    }
+
+    private fun setupLogsUi() {
+        val categoryOptions = listOf("All") + Logger.Category.entries.map { it.name }
+        val levelOptions = listOf("All") + Logger.Level.entries.map { it.name }
+        spinnerLogCategory.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, categoryOptions)
+        spinnerLogLevel.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, levelOptions)
+        val reload = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) = loadLogs()
+        }
+        spinnerLogCategory.onItemSelectedListener = reload
+        spinnerLogLevel.onItemSelectedListener = reload
+        btnCopyLogs.setOnClickListener { copyLogsToClipboard() }
+        btnExportLogs.setOnClickListener {
+            if (displayedLogs.isBlank()) return@setOnClickListener
+            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, displayedLogs)
+                putExtra(Intent.EXTRA_TITLE, "xCam diagnostic log")
+            }, getString(R.string.btn_export_logs)))
+        }
+        btnClearLogs.setOnClickListener {
+            contentResolver.call(android.net.Uri.parse("content://com.hazbu.xcam.provider"), com.hazbu.xcam.data.Constants.METHOD_CLEAR_LOGS, null, null)
+            loadLogs()
+        }
+    }
+
+    private fun loadLogs() {
+        val logs = runCatching {
+            contentResolver.call(
+                android.net.Uri.parse("content://com.hazbu.xcam.provider"),
+                com.hazbu.xcam.data.Constants.METHOD_GET_LOGS,
+                null,
+                null,
+            )?.getStringArrayList("logs").orEmpty()
+        }.getOrDefault(emptyList())
+        val category = spinnerLogCategory.selectedItem?.toString() ?: "All"
+        val level = spinnerLogLevel.selectedItem?.toString() ?: "All"
+        displayedLogs = logs.asReversed().filter { entry ->
+            val fields = entry.split('|', limit = 5)
+            (category == "All" || fields.getOrNull(2) == category) &&
+                (level == "All" || fields.getOrNull(1) == level)
+        }.joinToString("\n") { it.replace('|', ' ') }
+        tvLogs.text = displayedLogs.ifBlank { getString(R.string.label_no_logs) }
+    }
+
+    private fun copyLogsToClipboard() {
+        if (displayedLogs.isBlank()) return
+        (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)?.setPrimaryClip(
+            ClipData.newPlainText("xCam diagnostic log", displayedLogs)
+        )
+        Toast.makeText(this, R.string.toast_logs_copied, Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onDestroy() {
+        logRefreshHandler.removeCallbacks(logRefreshTask)
+        mediaImportExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     private fun setupTitleSpannable(tvTitle: TextView) {

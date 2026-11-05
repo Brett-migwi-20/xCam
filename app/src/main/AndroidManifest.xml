@@ -48,6 +48,9 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <receiver
+            android:name=".ui.PlaybackActionReceiver"
+            android:exported="false" />
         <provider
             android:name=".data.SettingsProvider"
             android:authorities="com.hazbu.xcam.provider"

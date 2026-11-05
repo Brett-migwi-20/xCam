@@ -5,6 +5,12 @@ object Constants {
     const val KEY_IS_ENABLED = "is_enabled"
     const val KEY_IS_MIRRORED = "is_mirrored"
     const val KEY_ROTATION_ANGLE = "rotation_angle"
+    const val KEY_MIRROR_VERTICAL = "mirror_vertical"
+    const val KEY_PLAYLIST = "playlist"
+    const val KEY_PLAYLIST_INDEX = "playlist_index"
+    const val KEY_PLAYBACK_STATE = "playback_state"
+    const val KEY_LOOP_ENABLED = "loop_enabled"
+    const val KEY_PLAYBACK_REVISION = "playback_revision"
     const val AUTHORITY = "com.hazbu.xcam.provider"
 
     const val DEFAULT_CAPTURE_WIDTH = 1280
@@ -19,6 +25,31 @@ object Constants {
 
     const val METHOD_RECORD_NODE = "record_node"
     const val METHOD_NOTIFY_CAPTURE = "notify_capture"
+    const val METHOD_PLAYBACK_ACTION = "playback_action"
+    const val METHOD_SET_MEDIA = "set_media"
+    const val METHOD_SET_ORIENTATION = "set_orientation"
+    const val METHOD_GET_LOGS = "get_logs"
+    const val METHOD_APPEND_LOG = "append_log"
+    const val METHOD_CLEAR_LOGS = "clear_logs"
+
+    const val EXTRA_ACTION = "action"
+    const val EXTRA_MEDIA_PATH = "media_path"
+    const val EXTRA_ROTATION = "rotation"
+    const val EXTRA_MIRRORED = "mirrored"
+    const val EXTRA_MIRROR_VERTICAL = "mirror_vertical"
+    const val EXTRA_LOG_ENTRY = "log_entry"
+
+    const val ACTION_PLAYBACK_TOGGLE = "com.hazbu.xcam.action.PLAYBACK_TOGGLE"
+    const val ACTION_PLAYBACK_PREVIOUS = "com.hazbu.xcam.action.PLAYBACK_PREVIOUS"
+    const val ACTION_PLAYBACK_NEXT = "com.hazbu.xcam.action.PLAYBACK_NEXT"
+    const val ACTION_PLAYBACK_COMPLETED = "com.hazbu.xcam.action.PLAYBACK_COMPLETED"
+    const val ACTION_PLAYBACK_STARTED = "com.hazbu.xcam.action.PLAYBACK_STARTED"
+    const val ACTION_PLAYBACK_PAUSED = "com.hazbu.xcam.action.PLAYBACK_PAUSED"
+    const val ACTION_PLAYBACK_STOPPED = "com.hazbu.xcam.action.PLAYBACK_STOPPED"
+
     const val CAPTURE_NOTIFICATION_CHANNEL_ID = "xcam_capture_channel"
     const val CAPTURE_NOTIFICATION_ID = 1001
+    const val PLAYBACK_NOTIFICATION_CHANNEL_ID = "xcam_playback_channel"
+    const val PLAYBACK_NOTIFICATION_ID = 1002
+    const val KEY_LOG_HISTORY = "log_history"
 }

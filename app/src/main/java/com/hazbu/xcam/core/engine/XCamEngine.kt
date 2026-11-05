@@ -23,6 +23,8 @@ class XCamEngine(
     
     private var lastST: SurfaceTexture? = null
     private var lastModernSurface: Surface? = null
+    private var activeSurface: Surface? = null
+    private var activePath: String? = null
     private var lastInjectedGen = -1
     private var lastInjectedSurfaceId = -1L
 
@@ -37,6 +39,8 @@ class XCamEngine(
         mediaEngine.stop()
         lastST = null
         lastModernSurface = null
+        activeSurface = null
+        activePath = null
         lastInjectedSurfaceId = -1L
         lastInjectedGen = -1
     }
@@ -48,7 +52,8 @@ class XCamEngine(
             return
         }
 
-        if ((st == lastST) && mediaEngine.isPlaying) {
+        if (st == lastST && activePath == settingsProvider().mediaPath) {
+            applyCurrentSettings()
             lastInjectedGen = surfaceManager.sessionGeneration
             return
         }
@@ -60,12 +65,15 @@ class XCamEngine(
         val settings = settingsProvider()
 
         logPipe("Legacy Hook: Injecting to SurfaceTexture")
-        mediaEngine.play(context, path, surface, "Legacy", settings.isMirrored, settings.rotationAngle)
+        activeSurface = surface
+        activePath = path
+        mediaEngine.play(context, path, surface, "Legacy", settings.isMirrored, settings.rotationAngle, settings.isPlaybackRequested)
     }
 
     fun handleModernPreview(surface: Surface) {
         val currentGen = surfaceManager.sessionGeneration
-        if (surface == lastModernSurface && mediaEngine.isPlaying) {
+        if (surface == lastModernSurface && activePath == settingsProvider().mediaPath) {
+            applyCurrentSettings()
             lastInjectedGen = currentGen
             return
         }
@@ -87,7 +95,8 @@ class XCamEngine(
             val currentGen = surfaceManager.sessionGeneration
             val settings = settingsProvider()
 
-            if (id == lastInjectedSurfaceId && mediaEngine.isPlaying) {
+            if (id == lastInjectedSurfaceId && activePath == path) {
+                applyCurrentSettings()
                 lastInjectedGen = currentGen
                 return
             }
@@ -97,8 +106,44 @@ class XCamEngine(
             
             lastInjectedGen = currentGen
             lastInjectedSurfaceId = id
-            mediaEngine.play(context, path, surface, "Engine", settings.isMirrored, settings.rotationAngle)
+            activeSurface = surface
+            activePath = path
+            mediaEngine.play(context, path, surface, "Engine", settings.isMirrored, settings.rotationAngle, settings.isPlaybackRequested)
         }
+    }
+
+    /** Called from the provider observer. Rotation/mirroring stay in-place; a new item reuses its surface. */
+    fun onSettingsChanged() {
+        uiHandler.post {
+            val settings = settingsProvider()
+            val path = settings.mediaPath
+            if (path == null) {
+                activePath = null
+                mediaEngine.stop()
+                return@post
+            }
+            val output = activeSurface
+            if (path != activePath && output?.isValid == true) {
+                activePath = path
+                mediaEngine.play(
+                    contextProvider() ?: return@post,
+                    path,
+                    output,
+                    "Settings",
+                    settings.isMirrored,
+                    settings.rotationAngle,
+                    settings.isPlaybackRequested,
+                )
+            } else {
+                applyCurrentSettings()
+            }
+        }
+    }
+
+    private fun applyCurrentSettings() {
+        val settings = settingsProvider()
+        mediaEngine.updateTransform(settings.isMirrored, settings.rotationAngle)
+        mediaEngine.setPlaying(settings.isPlaybackRequested)
     }
 
     fun getDummySurface(): Surface = surfaceProvider.getDummySurface()
