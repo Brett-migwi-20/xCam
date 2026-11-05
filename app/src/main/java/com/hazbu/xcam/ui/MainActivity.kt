@@ -497,7 +497,13 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         val raw = prefs.getString(com.hazbu.xcam.data.Constants.KEY_PLAYLIST, "[]") ?: "[]"
         val size = runCatching { org.json.JSONArray(raw).length() }.getOrDefault(0)
         tvPlaylistState.text = if (size == 0) getString(R.string.label_playlist_empty) else getString(R.string.label_playlist_state, index + 1, size, state.replaceFirstChar { it.uppercase() })
-        btnPlayPause.text = if (state == "playing") getString(R.string.btn_pause) else getString(R.string.btn_play)
+        val playing = state == "playing"
+        btnPlayPause.setIconResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play)
+        btnPlayPause.iconTint = ContextCompat.getColorStateList(
+            this,
+            if (playing) R.color.playback_red else R.color.playback_green
+        )
+        btnPlayPause.contentDescription = getString(if (playing) R.string.btn_pause else R.string.btn_play)
         val enabled = size > 0
         btnPlaylistPrevious.isEnabled = enabled
         btnPlayPause.isEnabled = enabled
