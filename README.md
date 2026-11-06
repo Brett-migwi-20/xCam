@@ -39,6 +39,76 @@
 
 ---
 
+
+## Viewing logs from targeted apps
+
+xCam's log viewer can mirror **logcat** so you can see output from the apps you hook (camera errors, MediaCodec warnings, crashes) next to xCam's own diagnostics. Android only allows this after a one-time permission grant, because `READ_LOGS` can't be requested from a normal permission dialog.
+
+Without the grant, the Logcat toggle still works but only shows xCam's own process.
+
+### Requirements
+
+- xCam installed with the `READ_LOGS` permission declared (included in the manifest).
+- Developer options enabled: **Settings → About phone → tap Build number 7 times**.
+- The target app added to xCam's scope in LSPosed.
+
+### Option A: from a computer (adb over USB)
+
+1. Enable **USB debugging** in Developer options and connect the phone.
+2. Confirm the device shows up:
+   ```
+   adb devices
+   ```
+3. Grant the permission:
+   ```
+   adb shell pm grant com.hazbu.xcam android.permission.READ_LOGS
+   ```
+4. Force-stop xCam (Settings → Apps → xCam → Force stop) and open it again. The grant only applies to a fresh process.
+
+### Option B: from Termux (no computer, Android 11+)
+
+Termux can't grant the permission by itself, but it can talk to the phone's own Wireless debugging service.
+
+1. Install the tools:
+   ```
+   pkg update && pkg install android-tools
+   ```
+2. In **Developer options → Wireless debugging**, turn it on (the phone must be on Wi-Fi).
+3. Tap **Pair device with pairing code**. Note the pairing port and the 6-digit code. Keep that screen visible, using split-screen or a floating window if needed.
+4. In Termux:
+   ```
+   adb pair localhost:<PAIRING_PORT>
+   ```
+   Enter the code when asked.
+5. Go back to the main Wireless debugging screen and note the (different) **connection port** next to the IP address:
+   ```
+   adb connect localhost:<CONNECTION_PORT>
+   ```
+6. Grant the permission:
+   ```
+   adb shell pm grant com.hazbu.xcam android.permission.READ_LOGS
+   ```
+7. Force-stop xCam and reopen it.
+
+**Rooted devices** can skip all of this: `su -c "pm grant com.hazbu.xcam android.permission.READ_LOGS"`.
+
+### Using it
+
+1. Open xCam and scroll to **Logs**.
+2. Turn on the **Logcat** chip.
+3. Open the target app and use its camera.
+4. Rows from other apps look like this: `[10:42:15.120] [ERROR] [LOGCAT] MediaCodec(1234) message`. The number in brackets is the app's process ID.
+5. Pick **LOGCAT** in the category dropdown to see only logcat lines, or pick any other category to hide them. The level chips filter by severity as usual.
+
+### Notes and troubleshooting
+
+- **Only seeing xCam's own lines:** the grant didn't apply. Re-run it, then force-stop xCam. Check with `adb shell dumpsys package com.hazbu.xcam | grep READ_LOGS`, which should show `granted=true`.
+- **`Unknown permission` or `not a changeable permission type`:** the permission isn't in the installed build's manifest. Rebuild and reinstall xCam, then grant again.
+- **Grant lost:** reinstalling xCam or rebooting some devices can clear it. Run the command again.
+- **Too much output:** logcat can be very chatty. Raise `LOGCAT_MIN_PRIORITY` in `Constants.kt` from `"I"` to `"W"` to store only warnings and above from other apps.
+- **Wireless debugging disconnects** when you leave the Wi-Fi network. You only need it for the grant, so it can be switched off afterward.
+- **Where hook logs go:** xCam's own hook messages are written through the Xposed log as well, so they also appear in the LSPosed manager's log screen.
+
 ## 📦 Installation & Setup
 
 ### 📱 Rooted Environments
