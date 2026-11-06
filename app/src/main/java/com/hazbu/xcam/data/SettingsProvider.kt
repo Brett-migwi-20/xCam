@@ -38,6 +38,7 @@ import com.hazbu.xcam.ui.PlaybackNotificationHelper
 import com.hazbu.xcam.utils.Logger
 import org.json.JSONArray
 import java.io.File
+import androidx.core.content.edit
 
 class SettingsProvider : ContentProvider() {
     override fun onCreate(): Boolean = true
@@ -73,22 +74,29 @@ class SettingsProvider : ContentProvider() {
                 return snapshotBundle(state)
             }
             METHOD_APPEND_LOG -> {
-                appendLog(prefs, extras?.getString(EXTRA_LOG_ENTRY))
+                extras?.getString(EXTRA_LOG_ENTRY)?.let { LogStore.append(ctx, it) }
                 return Bundle()
             }
-            METHOD_GET_LOGS -> return Bundle().apply { putStringArrayList("logs", readLogs(prefs)) }
+            METHOD_GET_LOGS -> return Bundle().apply {
+                // Capped: this path can cross a Binder boundary. The in-process UI reads LogStore directly.
+                putStringArrayList("logs", ArrayList(LogStore.items(ctx, 0).takeLast(500).map { it.line }))
+            }
             METHOD_CLEAR_LOGS -> {
-                prefs.edit().remove(KEY_LOG_HISTORY).apply()
+                LogStore.clear(ctx)
+                prefs.edit().remove(KEY_LOG_HISTORY).apply()   // drop the legacy SharedPreferences history
                 return Bundle()
             }
-            com.hazbu.xcam.data.Constants.METHOD_RECORD_NODE -> {
+            Constants.METHOD_RECORD_NODE -> {
                 val packageName = arg ?: "Unknown"
                 val route = extras?.getString("route") ?: ""
-                prefs.edit()
-                    .putString(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_APP, packageName)
-                    .putString(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_ROUTE, route)
-                    .putLong(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_TIME, System.currentTimeMillis())
-                    .apply()
+                prefs.edit {
+                    putString(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_APP, packageName)
+                        .putString(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_ROUTE, route)
+                        .putLong(
+                            com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_TIME,
+                            System.currentTimeMillis()
+                        )
+                }
             }
             com.hazbu.xcam.data.Constants.METHOD_NOTIFY_CAPTURE -> {
                 val packageName = arg ?: "Unknown"
@@ -97,11 +105,14 @@ class SettingsProvider : ContentProvider() {
                 val height = extras?.getInt("height") ?: 0
                 val thumbnail = extras?.getByteArray("thumbnail")
 
-                prefs.edit()
-                    .putString(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_APP, packageName)
-                    .putString(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_ROUTE, route)
-                    .putLong(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_TIME, System.currentTimeMillis())
-                    .apply()
+                prefs.edit {
+                    putString(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_APP, packageName)
+                        .putString(com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_ROUTE, route)
+                        .putLong(
+                            com.hazbu.xcam.data.Constants.KEY_LATEST_PIPELINE_TIME,
+                            System.currentTimeMillis()
+                        )
+                }
 
                 val isNotifEnabled = prefs.getBoolean(com.hazbu.xcam.data.Constants.KEY_ENABLE_CAPTURE_NOTIF, true)
                 if (isNotifEnabled) {
@@ -200,19 +211,4 @@ class SettingsProvider : ContentProvider() {
         putBoolean(KEY_IS_MIRRORED, state.orientation.mirrorHorizontal)
     }
 
-    private fun appendLog(prefs: android.content.SharedPreferences, entry: String?) {
-        if (entry.isNullOrBlank()) return
-        val logs = readLogs(prefs)
-        logs.add(entry.take(900))
-        while (logs.size > 250) logs.removeAt(0)
-        prefs.edit().putString(KEY_LOG_HISTORY, JSONArray(logs).toString()).apply()
-    }
-
-    private fun readLogs(prefs: android.content.SharedPreferences): ArrayList<String> {
-        val raw = prefs.getString(KEY_LOG_HISTORY, null) ?: return arrayListOf()
-        return runCatching {
-            val json = JSONArray(raw)
-            ArrayList<String>(json.length()).apply { for (i in 0 until json.length()) add(json.optString(i)) }
-        }.getOrDefault(arrayListOf())
-    }
 }

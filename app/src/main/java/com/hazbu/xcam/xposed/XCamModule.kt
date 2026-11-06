@@ -94,7 +94,12 @@ class XCamModule : XposedModule() {
             msg.contains("PLAYBACK") || msg.contains("MEDIA-ENGINE") -> Logger.Category.PLAYBACK
             else -> Logger.Category.CAMERA
         }
-        val level = if (tr != null || msg.contains("error", true) || msg.contains("failed", true) || msg.contains("FATAL")) Logger.Level.ERROR else Logger.Level.INFO
+        val level = when {
+            msg.contains("FATAL") -> Logger.Level.CRITICAL
+            tr != null || msg.contains("error", true) || msg.contains("failed", true) -> Logger.Level.ERROR
+            msg.contains("[+]") || msg.contains("success", true) -> Logger.Level.SUCCESS
+            else -> Logger.Level.INFO
+        }
         Logger.event(mContext, category, level, "module", msg, tr, this)
     }
 

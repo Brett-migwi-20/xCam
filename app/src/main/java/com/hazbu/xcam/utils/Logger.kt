@@ -20,15 +20,27 @@ object Logger {
     private val reporter = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "xCam-LogReporter").apply { isDaemon = true }
     }
+    enum class Category { UI, MEDIA, PLAYBACK, DECODER, FRAME, ROTATION, CAMERA, INJECTION, NOTIFICATION, AUDIO, PERFORMANCE, ERROR, LOGCAT }
 
-    enum class Category { UI, MEDIA, PLAYBACK, DECODER, FRAME, ROTATION, CAMERA, INJECTION, NOTIFICATION, AUDIO, PERFORMANCE, ERROR }
+
 
     enum class Level(val xPriority: Int) {
         DEBUG(XposedInterface.PRIORITY_DEFAULT),
         INFO(XposedInterface.PRIORITY_DEFAULT),
-        WARN(XposedInterface.PRIORITY_DEFAULT),
-        ERROR(XposedInterface.PRIORITY_DEFAULT)
+        SUCCESS(XposedInterface.PRIORITY_DEFAULT),
+        WARNING(XposedInterface.PRIORITY_DEFAULT),
+        ERROR(XposedInterface.PRIORITY_DEFAULT),
+        CRITICAL(XposedInterface.PRIORITY_DEFAULT)
     }
+
+    private val PATH_REGEX = Regex("(?:[A-Za-z]:)?[/\\\\][^\\s|]+[/\\\\]")
+
+    private fun sanitize(value: String): String =
+        value.replace(PATH_REGEX, "…/")
+            .replace('|', '/')
+            .replace("\r", "")
+            .replace('\n', '↵')
+            .take(Constants.LOG_MAX_MESSAGE_CHARS)   // was 800 (and 900 in the provider)
 
     /**
      * Structured application event. The provider call is serialized off the caller's render,
@@ -68,13 +80,6 @@ object Logger {
 
     fun recent(): List<String> = synchronized(historyLock) { history.toList() }
 
-    private fun sanitize(value: String): String {
-        // Keep media names useful, but avoid turning the persistent support log into a path dump.
-        return value.replace(Regex("(?:[A-Za-z]:)?[/\\\\][^\\s|]+[/\\\\]"), "…/")
-            .replace('|', '/')
-            .take(800)
-    }
-
     fun d(xi: XposedInterface?, msg: String) = printLog(xi, msg, Level.DEBUG)
     fun i(xi: XposedInterface?, msg: String) = printLog(xi, msg, Level.INFO)
     fun e(xi: XposedInterface?, msg: String, tr: Throwable? = null) = printLog(xi, msg, Level.ERROR, tr)
@@ -88,9 +93,9 @@ object Logger {
         } else {
             when (level) {
                 Level.DEBUG -> Log.d(TAG, fullMsg)
-                Level.INFO -> Log.i(TAG, fullMsg)
-                Level.WARN -> Log.w(TAG, fullMsg, tr)
-                Level.ERROR -> Log.e(TAG, fullMsg, tr)
+                Level.INFO, Level.SUCCESS -> Log.i(TAG, fullMsg)
+                Level.WARNING -> Log.w(TAG, fullMsg, tr)
+                Level.ERROR, Level.CRITICAL -> Log.e(TAG, fullMsg, tr)
             }
         }
     }

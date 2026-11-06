@@ -52,4 +52,11 @@ object Constants {
     const val PLAYBACK_NOTIFICATION_CHANNEL_ID = "xcam_playback_channel"
     const val PLAYBACK_NOTIFICATION_ID = 1002
     const val KEY_LOG_HISTORY = "log_history"
+
+    const val LOG_STORE_MAX_ENTRIES = 5_000   // persisted history
+    const val LOG_VIEW_MAX_ENTRIES = 2_000    // rows kept in the on-screen list
+    const val LOG_MAX_MESSAGE_CHARS = 4_000
+
+    const val LOGCAT_MIN_PRIORITY = "I"   // V, D, I, W, E; applies when READ_LOGS lets us see other apps
+
 }

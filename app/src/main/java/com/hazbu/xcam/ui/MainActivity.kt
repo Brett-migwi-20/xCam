@@ -3,7 +3,6 @@ package com.hazbu.xcam.ui
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
@@ -11,16 +10,12 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.view.View
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ArrayAdapter
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
@@ -89,26 +84,28 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
     private lateinit var tvPipelineRoute: TextView
     private lateinit var tvPipelineTime: TextView
     private lateinit var btnCopyPipeline: MaterialButton
-    private lateinit var btnClearPipeline: MaterialButton
-    private lateinit var spinnerLogCategory: Spinner
-    private lateinit var spinnerLogLevel: Spinner
-    private lateinit var tvLogs: TextView
-    private lateinit var btnCopyLogs: MaterialButton
-    private lateinit var btnExportLogs: MaterialButton
-    private lateinit var btnClearLogs: MaterialButton
+   private lateinit var btnClearPipeline: MaterialButton
+//    private lateinit var spinnerLogCategory: Spinner
+//    private lateinit var spinnerLogLevel: Spinner
+//    private lateinit var tvLogs: TextView
+//    private lateinit var btnCopyLogs: MaterialButton
+//    private lateinit var btnExportLogs: MaterialButton
+//    private lateinit var btnClearLogs: MaterialButton
 
     private var isMirrored = false
     private var rotationAngle = 0
     private var mXposedService: XposedService? = null
     private val mediaImportExecutor = Executors.newSingleThreadExecutor()
-    private val logRefreshHandler = Handler(Looper.getMainLooper())
-    private var displayedLogs = ""
-    private val logRefreshTask = object : Runnable {
-        override fun run() {
-            loadLogs()
-            logRefreshHandler.postDelayed(this, 2_000L)
-        }
-    }
+//    private val logRefreshHandler = Handler(Looper.getMainLooper())
+//    private var displayedLogs = ""
+//    private val logRefreshTask = object : Runnable {
+//        override fun run() {
+//            loadLogs()
+//            logRefreshHandler.postDelayed(this, 2_000L)
+//        }
+//    }
+
+    private lateinit var logViewer: LogViewerController
 
     private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -146,12 +143,12 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         super.onResume()
         loadSettings()
         updateModuleStatusUI()
-        logRefreshHandler.removeCallbacks(logRefreshTask)
-        logRefreshHandler.post(logRefreshTask)
+        logViewer.start()
+
     }
 
     override fun onPause() {
-        logRefreshHandler.removeCallbacks(logRefreshTask)
+        logViewer.stop()
         super.onPause()
     }
 
@@ -170,7 +167,7 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         val isActive = service != null || checkSelfActive()
 
         if (isActive) {
-            val statusText = if (service != null && !service.frameworkName.isNullOrBlank()) {
+            val statusText = if (service != null && service.frameworkName.isNotBlank()) {
                 "${getString(R.string.status_module_active)} (${service.frameworkName})"
             } else {
                 getString(R.string.status_module_active)
@@ -234,13 +231,8 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         tvPipelineTime = findViewById(R.id.tv_pipeline_time)
         btnCopyPipeline = findViewById(R.id.btn_copy_pipeline)
         btnClearPipeline = findViewById(R.id.btn_clear_pipeline)
-        spinnerLogCategory = findViewById(R.id.spinner_log_category)
-        spinnerLogLevel = findViewById(R.id.spinner_log_level)
-        tvLogs = findViewById(R.id.tv_logs)
-        btnCopyLogs = findViewById(R.id.btn_copy_logs)
-        btnExportLogs = findViewById(R.id.btn_export_logs)
-        btnClearLogs = findViewById(R.id.btn_clear_logs)
-        setupLogsUi()
+        logViewer = LogViewerController(findViewById(R.id.card_logs))
+
 
         switchCaptureNotif.setOnCheckedChangeListener { _, isChecked ->
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit {
@@ -274,7 +266,7 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
                 if (formattedTime.isNotEmpty()) append("Time: $formattedTime")
             }.trim()
 
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clipboard = getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager
             val clip = ClipData.newPlainText("xCam Pipeline", copyText)
             clipboard?.setPrimaryClip(clip)
             Toast.makeText(this, "Pipeline route copied to clipboard", Toast.LENGTH_SHORT).show()
@@ -510,61 +502,12 @@ class MainActivity : AppCompatActivity(), XposedServiceHelper.OnServiceListener 
         btnPlaylistNext.isEnabled = enabled
     }
 
-    private fun setupLogsUi() {
-        val categoryOptions = listOf("All") + Logger.Category.entries.map { it.name }
-        val levelOptions = listOf("All") + Logger.Level.entries.map { it.name }
-        spinnerLogCategory.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, categoryOptions)
-        spinnerLogLevel.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, levelOptions)
-        val reload = object : android.widget.AdapterView.OnItemSelectedListener {
-            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
-            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) = loadLogs()
-        }
-        spinnerLogCategory.onItemSelectedListener = reload
-        spinnerLogLevel.onItemSelectedListener = reload
-        btnCopyLogs.setOnClickListener { copyLogsToClipboard() }
-        btnExportLogs.setOnClickListener {
-            if (displayedLogs.isBlank()) return@setOnClickListener
-            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                type = "text/plain"
-                putExtra(Intent.EXTRA_TEXT, displayedLogs)
-                putExtra(Intent.EXTRA_TITLE, "xCam diagnostic log")
-            }, getString(R.string.btn_export_logs)))
-        }
-        btnClearLogs.setOnClickListener {
-            contentResolver.call(android.net.Uri.parse("content://com.hazbu.xcam.provider"), com.hazbu.xcam.data.Constants.METHOD_CLEAR_LOGS, null, null)
-            loadLogs()
-        }
-    }
 
-    private fun loadLogs() {
-        val logs = runCatching {
-            contentResolver.call(
-                android.net.Uri.parse("content://com.hazbu.xcam.provider"),
-                com.hazbu.xcam.data.Constants.METHOD_GET_LOGS,
-                null,
-                null,
-            )?.getStringArrayList("logs").orEmpty()
-        }.getOrDefault(emptyList())
-        val category = spinnerLogCategory.selectedItem?.toString() ?: "All"
-        val level = spinnerLogLevel.selectedItem?.toString() ?: "All"
-        displayedLogs = logs.asReversed().filter { entry ->
-            val fields = entry.split('|', limit = 5)
-            (category == "All" || fields.getOrNull(2) == category) &&
-                    (level == "All" || fields.getOrNull(1) == level)
-        }.joinToString("\n") { it.replace('|', ' ') }
-        tvLogs.text = displayedLogs.ifBlank { getString(R.string.label_no_logs) }
-    }
 
-    private fun copyLogsToClipboard() {
-        if (displayedLogs.isBlank()) return
-        (getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager)?.setPrimaryClip(
-            ClipData.newPlainText("xCam diagnostic log", displayedLogs)
-        )
-        Toast.makeText(this, R.string.toast_logs_copied, Toast.LENGTH_SHORT).show()
-    }
+
 
     override fun onDestroy() {
-        logRefreshHandler.removeCallbacks(logRefreshTask)
+
         mediaImportExecutor.shutdownNow()
         super.onDestroy()
     }

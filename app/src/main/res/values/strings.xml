@@ -37,5 +37,11 @@
     <string name="label_last_active_app">Target: %s</string>
     <string name="label_last_route">Hook Route: %s</string>
     <string name="label_last_timestamp">Time: %s</string>
+    <string name="label_log_autoscroll">Auto-scroll</string>
+    <string name="label_log_pause">Pause</string>
+    <string name="label_log_resume">Resume</string>
+    <string name="label_log_latest">↓ Latest</string>
+    <string name="label_log_new_count">↓ %1$d new</string>
+    <string name="label_log_line_count">%1$d lines</string>
 </resources>
 
