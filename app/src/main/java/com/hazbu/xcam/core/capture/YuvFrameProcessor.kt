@@ -39,6 +39,18 @@ class YuvFrameProcessor {
         return result
     }
 
+    /**
+     * Called once per ImageReader acquisition (potentially several times per decoded frame,
+     * once per active stream resolution). Three paths, cheapest first:
+     *  1. identity (no rotation/mirror, same dimensions) -> bulk row copy.
+     *  2. rotation == 0 (the default/common case; only scaling and/or mirroring) -> the
+     *     per-column source index only depends on x, not y, so it is computed once per plane
+     *     instead of recomputed (with a division and modulo) for every one of the ~10M pixels
+     *     across the Y/U/V planes of a high-resolution reader.
+     *  3. an active rotation (90/180/270) -> falls back to the original per-pixel sample(),
+     *     since the source index then depends jointly on x and y and this is a rare,
+     *     user-triggered case rather than the steady-state hot path.
+     */
     fun injectYuvFrame(
         image: Image,
         frame: MediaCodecYuvDecoder.YuvFrame,
@@ -48,13 +60,16 @@ class YuvFrameProcessor {
     ) {
         val planes = image.planes
         if (planes.size < 3 || image.width <= 0 || image.height <= 0) return
-        writeTransformedPlane(planes[0], frame.yPlane, frame.width, frame.height, image.width, image.height, rotationAngle, mirrorHorizontal, mirrorVertical)
+        val rotation = ((rotationAngle % 360) + 360) % 360
+        val identity = rotation == 0 && !mirrorHorizontal && !mirrorVertical
+
+        writeTransformedPlane(planes[0], frame.yPlane, frame.width, frame.height, image.width, image.height, rotation, mirrorHorizontal, mirrorVertical, identity)
         val dstChromaW = (image.width + 1) / 2
         val dstChromaH = (image.height + 1) / 2
         val sourceChromaW = (frame.width + 1) / 2
         val sourceChromaH = (frame.height + 1) / 2
-        writeTransformedPlane(planes[1], frame.uPlane, sourceChromaW, sourceChromaH, dstChromaW, dstChromaH, rotationAngle, mirrorHorizontal, mirrorVertical)
-        writeTransformedPlane(planes[2], frame.vPlane, sourceChromaW, sourceChromaH, dstChromaW, dstChromaH, rotationAngle, mirrorHorizontal, mirrorVertical)
+        writeTransformedPlane(planes[1], frame.uPlane, sourceChromaW, sourceChromaH, dstChromaW, dstChromaH, rotation, mirrorHorizontal, mirrorVertical, identity)
+        writeTransformedPlane(planes[2], frame.vPlane, sourceChromaW, sourceChromaH, dstChromaW, dstChromaH, rotation, mirrorHorizontal, mirrorVertical, identity)
     }
 
     fun rgbToNv21(bitmap: android.graphics.Bitmap, width: Int, height: Int): ByteArray {
@@ -104,14 +119,70 @@ class YuvFrameProcessor {
         rotationAngle: Int,
         mirrorHorizontal: Boolean,
         mirrorVertical: Boolean,
+        identity: Boolean,
     ) {
         val buffer = plane.buffer
         val start = buffer.position()
-        for (y in 0 until destinationHeight) for (x in 0 until destinationWidth) {
-            val destination = start + y * plane.rowStride + x * plane.pixelStride
-            if (destination < buffer.limit()) {
-                buffer.put(destination, sample(source, sourceWidth, sourceHeight, destinationWidth, destinationHeight, x, y, rotationAngle, mirrorHorizontal, mirrorVertical))
+        val limit = buffer.limit()
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+
+        try {
+            if (identity && sourceWidth == destinationWidth && sourceHeight == destinationHeight) {
+                if (pixelStride == 1) {
+                    for (y in 0 until destinationHeight) {
+                        val rowStart = start + y * rowStride
+                        if (rowStart >= limit) break
+                        val count = (limit - rowStart).coerceAtMost(destinationWidth)
+                        if (count <= 0) continue
+                        buffer.position(rowStart)
+                        buffer.put(source, y * sourceWidth, count)
+                    }
+                } else {
+                    for (y in 0 until destinationHeight) {
+                        val rowStart = start + y * rowStride
+                        val srcRow = y * sourceWidth
+                        for (x in 0 until destinationWidth) {
+                            val destination = rowStart + x * pixelStride
+                            if (destination < limit) buffer.put(destination, source[srcRow + x])
+                        }
+                    }
+                }
+                return
             }
+
+            if (rotationAngle == 0) {
+                // Column source-index only depends on x: compute once per plane, not per pixel.
+                val colIndex = IntArray(destinationWidth) { x ->
+                    val sourceX = (x * sourceWidth / destinationWidth).coerceIn(0, sourceWidth - 1)
+                    if (mirrorHorizontal) sourceWidth - 1 - sourceX else sourceX
+                }
+                for (y in 0 until destinationHeight) {
+                    var sourceY = (y * sourceHeight / destinationHeight).coerceIn(0, sourceHeight - 1)
+                    if (mirrorVertical) sourceY = sourceHeight - 1 - sourceY
+                    val srcRow = sourceY * sourceWidth
+                    val rowStart = start + y * rowStride
+                    if (rowStart >= limit) break
+                    for (x in 0 until destinationWidth) {
+                        val destination = rowStart + x * pixelStride
+                        if (destination < limit) buffer.put(destination, source[srcRow + colIndex[x]])
+                    }
+                }
+                return
+            }
+
+            // Active rotation: rare (user-triggered), keep the general per-pixel path.
+            for (y in 0 until destinationHeight) for (x in 0 until destinationWidth) {
+                val destination = start + y * rowStride + x * pixelStride
+                if (destination < limit) {
+                    buffer.put(destination, sample(source, sourceWidth, sourceHeight, destinationWidth, destinationHeight, x, y, rotationAngle, mirrorHorizontal, mirrorVertical))
+                }
+            }
+        } finally {
+            // Bulk put()/relative get() above move the buffer's position; restore it so the
+            // plane's buffer is left exactly as callers of the original absolute-put
+            // implementation would have found it (position unchanged at `start`).
+            buffer.position(start)
         }
     }
 

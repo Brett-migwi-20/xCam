@@ -9,7 +9,6 @@ import android.media.MediaFormat
 import android.os.SystemClock
 import androidx.core.net.toUri
 import java.util.ArrayDeque
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 
 /**
@@ -257,15 +256,40 @@ class MediaCodecYuvDecoder(
         copyPlane(image.planes[2], storage.v, chromaWidth, chromaHeight)
     }
 
+    /**
+     * Copies one decoder output plane into a flat byte array.
+     *
+     * The hot path (pixelStride == 1, the common case for the Y plane and for fully planar
+     * chroma output) uses ByteBuffer's bulk get(), which is backed by a native/array copy
+     * rather than a per-byte relative-get call. A 1080p Y plane is 2M+ bytes; copying it one
+     * byte at a time via buffer.get(index) was measurably the dominant cost of decodeLoop()
+     * before this change. Interleaved/semi-planar chroma (pixelStride != 1, e.g. NV12-style
+     * U/V) still requires a per-pixel stride walk and keeps the original approach.
+     */
     private fun copyPlane(plane: Image.Plane, target: ByteArray, width: Int, height: Int) {
         val buffer = plane.buffer.duplicate()
         val start = buffer.position()
-        for (row in 0 until height) {
-            val rowStart = start + row * plane.rowStride
-            val destination = row * width
-            for (column in 0 until width) {
-                val source = rowStart + column * plane.pixelStride
-                if (source < buffer.limit()) target[destination + column] = buffer.get(source)
+        val limit = buffer.limit()
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+
+        if (pixelStride == 1) {
+            for (row in 0 until height) {
+                val rowStart = start + row * rowStride
+                if (rowStart >= limit) break
+                val available = (limit - rowStart).coerceAtMost(width)
+                if (available <= 0) continue
+                buffer.position(rowStart)
+                buffer.get(target, row * width, available)
+            }
+        } else {
+            for (row in 0 until height) {
+                val rowStart = start + row * rowStride
+                val destination = row * width
+                for (column in 0 until width) {
+                    val source = rowStart + column * pixelStride
+                    if (source < limit) target[destination + column] = buffer.get(source)
+                }
             }
         }
     }
